@@ -1,0 +1,189 @@
+# 동물병원 WAS
+
+FastAPI 기반 동물병원 접수·진료 WAS입니다.
+데스크(간호사)용 기능과 수의사용 기능을 각각 별도 프로세스에서 처리하고, 프로세스 안에서는 비동기로 여러 요청을 동시에 처리합니다.
+
+## 실행
+
+```bash
+pip install -r requirements.txt
+python start.py
+```
+
+- 주소: `http://127.0.0.1:8000` (Swagger 문서: `/docs`)
+- 실행할 때 `DB_PATH`에 SQLite 파일을 만들고, 테이블이 없으면 생성합니다. 종료해도 DB는 지우지 않습니다.
+- `reload`는 끄고 실행합니다. 켜면 uvicorn이 서버를 다른 프로세스에서 다시 import해서 Pipe가 워커와 끊깁니다.
+- 코드를 고친 뒤에는 서버를 직접 다시 실행해야 합니다.
+
+### 설정 (환경변수)
+
+설정값은 [config.py](config.py)에서 환경변수로 읽습니다. 로컬에서는 `.env.example`을 `.env`로 복사해서 고치면 되고, 클라우드에서는 환경변수로 직접 넣으면 됩니다(같은 값이 둘 다 있으면 환경변수가 우선). 아무것도 없으면 아래 기본값으로 실행합니다.
+
+| 이름 | 기본값 | 설명 |
+|---|---|---|
+| `WAS_HOST` | `127.0.0.1` | 서버 주소. 클라우드(컨테이너/VM)는 `0.0.0.0` |
+| `WAS_PORT` | `8000` | 서버 포트 |
+| `DB_PATH` | `petclinic.db` | SQLite 파일 경로. 클라우드는 재시작해도 남는 볼륨 경로로 지정 |
+| `COOKIE_SECURE` | `false` | HTTPS로 서비스하면 `true` (세션 쿠키를 HTTPS에서만 전송) |
+
+- `.env`와 DB 파일은 `.gitignore`에 들어 있어서 저장소에 올라가지 않습니다.
+- 세션은 DB(`sessions` 테이블)에 저장하므로 WAS가 메모리에 로그인 상태를 들고 있지 않습니다. 다만 DB가 로컬 SQLite 파일이라, WAS를 여러 대로 늘리려면 모든 WAS가 같은 DB를 쓰도록 공용 DB로 바꿔야 합니다.
+- 테스트 계정은 서버를 시작할 때마다 자동으로 들어갑니다. 실제 운영 전에는 비밀번호를 바꾸거나 제거해야 합니다.
+
+### 테스트 계정
+
+서버를 시작할 때 없는 아이디만 추가합니다(이미 있는 계정은 그대로 둡니다). 비밀번호는 모두 `1234`입니다.
+
+| 지점 | 데스크 | 수의사 |
+|---|---|---|
+| 강남점 | desk1 (김간호) | vet1 (이수의), vet2 (박수의) |
+| 홍대점 | desk2 (최간호) | vet3 (정수의), vet4 (한수의) |
+| 서초점 | desk3 (윤간호) | vet5 (강수의), vet6 (조수의) |
+| 잠실점 | desk4 (임간호) | vet7 (신수의), vet8 (오수의) |
+| 분당점 | desk5 (서간호) | vet9 (권수의), vet10 (황수의) |
+
+## 구조
+
+```
+main 프로세스 ─ login_router → LoginControllers → UserService → UserRepository
+     │                                                        └ SessionRepository
+     │
+     ├─ Pipe ─ desk 프로세스 ─ desk_router → DeskControllers → OwnerService        → OwnerRepository
+     │                                                      ├ PetService          → PetRepository
+     │                                                      ├ ConsultationService → ConsultationRepository
+     │                                                      └ UserService         → UserRepository
+     │
+     └─ Pipe ─ vet 프로세스 ─ vet_router → VetControllers → ConsultationService → ConsultationRepository
+```
+
+- 라우터는 main 프로세스에서 요청을 받아 `(요청 id, 메서드 이름, 인자)`를 Pipe로 보냅니다.
+- 워커 프로세스는 받은 요청마다 asyncio task를 만들어 동시에 처리하고, `(요청 id, 결과)`를 돌려보냅니다.
+- DB 작업은 별도 스레드에서 실행합니다. 그래서 한 요청이 DB를 기다리는 동안 같은 프로세스에서 다른 요청을 처리할 수 있습니다.
+- 워커에서 예외가 나면 워커는 계속 살아 있고, 예외는 main으로 전달되어 500으로 응답합니다.
+- 워커 프로세스가 죽으면 그 프로세스로 가는 요청은 멈추지 않고 바로 에러로 끝납니다.
+- 주인 등록, 동물 추가는 트랜잭션으로 묶여 있어서, 중간에 실패하면 모두 취소됩니다.
+
+```
+start.py                    서버 시작 (DB 생성 → 워커 실행 → uvicorn)
+process.py                  워커 프로세스, Pipe 통신(Channel)
+routers/                    라우터, 세션 확인
+routers/datamodels/         요청·응답 모델 (pydantic)
+controllers/                프로세스별 컨트롤러
+services/                   서비스
+repositorys/                레포지토리, DB 연결·트랜잭션·테이블 생성
+```
+
+## DB
+
+| 테이블 | 컬럼 |
+|---|---|
+| users | uid, login_id(UNIQUE), password(sha256), name, role(`desk`/`vet`), branch |
+| sessions | session_id(쿠키 값), uid → users, created_at |
+| owners | oid, oname, pnum, address, branch(등록한 지점) |
+| pets | pid, oid → owners, pname, gender, age, weight, type, breed, notes |
+| consultations | cid, pid → pets, vet_uid → users, date(등록 시각 자동), purpose, diagnosis, status(`대기`/`진료중`/`종료`) |
+
+- 방문 등록부터 진료 종료까지가 `consultations`의 한 행입니다.
+- 보호자는 등록한 간호사의 지점(`branch`)으로 저장됩니다. 동물과 진료는 보호자를 통해 지점이 정해집니다.
+- 다른 지점의 보호자·동물·진료 이력은 조회·수정·방문 등록이 모두 안 됩니다(404). 같은 손님이 두 지점을 다니면 지점마다 따로 등록합니다.
+
+## 인증
+
+- `POST /login`에 성공하면 `session_id` 쿠키(httponly)가 생깁니다. 이후 요청에는 이 쿠키를 같이 보내야 합니다.
+- `/desk/*`는 desk 계정만, `/vet/*`는 vet 계정만 호출할 수 있습니다. 아니면 401입니다.
+- 세션은 DB `sessions` 테이블에 저장합니다. 로그인하면 행이 생기고 로그아웃하면 지워집니다. WAS를 재시작해도 로그인이 유지됩니다.
+- 요청마다 쿠키의 `session_id`로 `sessions` ↔ `users`를 조회해서 사용자와 권한을 확인합니다.
+- 세션 만료 시간은 없습니다. 로그아웃하기 전까지 유지됩니다.
+- 로그인 후 홈 이동, 로그아웃 후 로그인 페이지 이동은 클라이언트가 응답의 `role`을 보고 처리합니다.
+
+## 공통 응답 코드
+
+| 코드 | 의미 |
+|---|---|
+| 200 | 성공 |
+| 401 | 로그인 실패, 세션 없음, 권한 다름 |
+| 404 | 대상이 없음, 또는 규칙에 맞지 않음 (남의 진료, 진료 순서 위반, 다른 지점 의사 배정 등) |
+| 422 | 요청 형식 오류 (필수 값 누락·null, 동물 0마리 등) |
+| 500 | 서버 내부 오류 |
+
+## 데이터 모델
+
+**User**
+```json
+{ "uid": 1, "name": "김간호", "role": "desk", "branch": "강남점" }
+```
+
+**Pet**
+```json
+{ "pid": 1, "pname": "코코", "gender": "수", "age": 2, "weight": "3.5",
+  "type": "개", "breed": null, "notes": null }
+```
+- `weight`는 Decimal이라 응답에서 문자열로 나옵니다. 요청에는 숫자와 문자열 모두 쓸 수 있습니다.
+
+**Owner**
+```json
+{ "oid": 1, "oname": "김민주", "pnum": "010-1234-5678", "address": "서울",
+  "pets": [ Pet, ... ] }
+```
+
+**Consultation**
+```json
+{ "cid": 1, "pid": 1, "pname": "코코", "vet_uid": 2, "vet_name": "이수의",
+  "date": "2026-10-19 14:30:00", "purpose": "기침", "diagnosis": null, "status": "대기" }
+```
+
+**ConsultationDetail**: Consultation + `"pet": Pet`
+
+## API
+
+### 로그인 (main 프로세스)
+
+| 메서드 | 경로 | 기능 | 요청 | 응답 |
+|---|---|---|---|---|
+| POST | `/login` | 아이디·비밀번호 확인 → 세션 생성 | `{ "login_id", "password" }` | User + 쿠키 |
+| DELETE | `/login` | 로그아웃, 세션 삭제 | - | `null` |
+
+### 데스크 (desk 프로세스, desk 계정)
+
+| 메서드 | 경로 | 기능 | 요청 | 응답 |
+|---|---|---|---|---|
+| POST | `/desk/owner` | 주인 + 동물(1마리 이상) 등록 | `{ "oname", "pnum", "address"?, "pets": [PetRequest, ...] }` | Owner |
+| GET | `/desk/owner/{owner_id}` | 주인, 동물 정보 보기 | - | Owner |
+| GET | `/desk/owner?name=` | 주인 이름 검색 (부분 일치) | - | [Owner] |
+| PATCH | `/desk/owner/{owner_id}` | 주인 정보 수정 | `{ "oname"?, "pnum"?, "address"? }` | Owner |
+| GET | `/desk/pet/{pet_id}` | 동물 상세 | - | Pet |
+| PATCH | `/desk/pet/{pet_id}` | 동물 정보 수정 | PetRequest의 필드 중 일부 | Pet |
+| POST | `/desk/pet` | 기존 주인에 동물(1마리 이상) 추가 | `{ "oid", "pets": [PetRequest, ...] }` | Owner (갱신된 전체) |
+| POST | `/desk/pet/{pet_id}/consultation` | 방문 등록 (상태 `대기`) | `{ "vet_uid", "purpose" }` | Consultation |
+| GET | `/desk/pet/{pet_id}/consultation` | 진료 이력 (최신순) | - | [Consultation] |
+| GET | `/desk/vets` | 로그인한 간호사와 같은 지점의 수의사 목록 | - | [User] |
+
+- **PetRequest:** `{ "pname", "type", "gender"?, "age"?, "weight"?, "breed"?, "notes"? }` (`?`는 생략 가능)
+- **PATCH:** 보낸 필드만 수정합니다. 선택 항목(`address`, `gender`, `age`, `weight`, `breed`, `notes`)은 `null`로 비울 수 있습니다. 필수 항목(`oname`, `pnum`, `pname`, `type`)에 `null`을 보내면 422입니다.
+- **지점:** 모든 데스크 API는 로그인한 간호사 지점의 데이터만 다룹니다. 다른 지점 데이터는 없는 것과 같이 404(검색·이력은 빈 목록)입니다.
+- **방문 등록:** 같은 지점 수의사(`vet_uid`)만 배정할 수 있고, 아니면 404입니다. 날짜는 서버가 등록 시각으로 저장합니다.
+- **동물 삭제 기능은 없습니다.**
+
+### 수의사 (vet 프로세스, vet 계정)
+
+| 메서드 | 경로 | 기능 | 요청 | 응답 |
+|---|---|---|---|---|
+| GET | `/vet/consultation` | 나에게 배정된 `대기`·`진료중` 목록 (등록순) | - | [Consultation] |
+| PATCH | `/vet/consultation/{consultation_id}/start` | 진료 시작 (`대기` → `진료중`) | - | ConsultationDetail |
+| GET | `/vet/consultation/{consultation_id}` | 현재 진료 정보 (동물 정보 포함) | - | ConsultationDetail |
+| GET | `/vet/consultation/history/{pet_id}` | 동물의 진료 이력 (최신순) | - | [Consultation] |
+| PATCH | `/vet/consultation/{consultation_id}` | 진단 작성 (`진료중`일 때만, 여러 번 수정 가능) | `{ "diagnosis" }` | ConsultationDetail |
+| PATCH | `/vet/consultation/{consultation_id}/end` | 진료 종료 (`진료중` → `종료`) | - | ConsultationDetail |
+
+- 자기에게 배정된 진료만 보고 바꿀 수 있습니다. 남의 진료나 순서에 맞지 않는 요청은 404입니다.
+- 진료 이력(`/vet/consultation/history/{pet_id}`)은 자기 지점 동물만 조회됩니다.
+- 목록의 맨 위 건만 시작하도록 강제하지는 않습니다. 순서는 클라이언트가 지킵니다.
+
+## 원래 명세와 다른 점
+
+- 명세는 지점 구분을 의사 배정에만 쓰지만, 보호자 명단이 지점 간에 공유되지 않도록 보호자를 지점별로 나눴습니다.
+- 경로 앞에 `/login`, `/desk`, `/vet` prefix가 붙습니다.
+- 명세의 `PATCH /pet{pet_id}`는 `PATCH /desk/pet/{pet_id}`로 구현했습니다(오타로 판단).
+- 로그인 페이지 보여주기(`GET /`)와 동물 삭제(`DELETE /pet/{pet_id}`)는 없습니다.
+- 방문 날짜는 입력받지 않고 서버가 자동으로 저장합니다.
+- `users`에 `name` 컬럼을 추가했습니다(담당 의사 이름 표시용).
